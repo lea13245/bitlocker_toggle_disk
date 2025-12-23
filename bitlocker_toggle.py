@@ -1,120 +1,126 @@
-import subprocess
-import os
-import re
-import ctypes
+# BitLocker / USB Auto Handler (DFIR Safe)
+function Is-Admin {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $p  = New-Object Security.Principal.WindowsPrincipal($id)
+    $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
 
-LETRA_UNIDAD = "E:"
+function Get-WindowsEdition {
+    try {
+        (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion").EditionID
+    } catch { "UNKNOWN" }
+}
 
-def clear_console():
-    """Limpia la consola en Windows."""
-    os.system('cls')
+function ManageBDE-Exists {
+    Test-Path "$env:SystemRoot\System32\manage-bde.exe"
+}
 
-def estado_disco():
-    """
-    Verifica el estado actual de BitLocker para la unidad especificada.
-    Devuelve "bloqueado", "desbloqueado" o None si no se puede determinar el estado.
-    """
-    comando = f'manage-bde -status {LETRA_UNIDAD}'
-    try:
-        resultado = subprocess.run(comando, shell=True, capture_output=True, text=True, encoding='cp850', errors='replace')
+function Get-DriveBusType($drive) {
+    try {
+        $dl = $drive.TrimEnd(":")
+        (Get-Partition -DriveLetter $dl | Get-Disk).BusType
+    } catch { "UNKNOWN" }
+}
 
-        if resultado.returncode != 0:
-            print(f"Error al consultar el estado del disco {LETRA_UNIDAD}:")
-            print(resultado.stderr or resultado.stdout)
-            return None
+function Drive-Accessible($drive) {
+    Test-Path "$drive\"
+}
 
-        salida = resultado.stdout.lower()
-        salida_normalizada = re.sub(r'\s+', ' ', salida).strip()
+function Get-BitLockerStatus($drive) {
+    try { & manage-bde -status $drive 2>&1 } catch { $null }
+}
 
-        if "estado de bloqueo: bloqueado" in salida_normalizada:
-            return "bloqueado"
-        elif "estado de bloqueo: desbloqueado" in salida_normalizada:
-            return "desbloqueado"
-        elif "estado de conversión: sin cifrar" in salida_normalizada or "protección desactivada" in salida_normalizada:
-            print(f"La unidad {LETRA_UNIDAD} no está cifrada con BitLocker.")
-            return None
-        else:
-            print("No se pudo determinar el estado del disco (no se encontró 'bloqueado' ni 'desbloqueado' en la salida).")
-            return None
+function Copy-RawFile {
+    param($src)
 
-    except subprocess.SubprocessError as e:
-        print(f"Error al ejecutar el comando manage-bde: {str(e)}")
-        return None
-    except Exception as e:
-        print(f"Excepción inesperada: {str(e)}")
-        return None
+    $dstDir = "$env:USERPROFILE\Downloads\DFIR_Copy"
+    New-Item -ItemType Directory -Path $dstDir -Force | Out-Null
+    $dst = Join-Path $dstDir ([IO.Path]::GetFileName($src))
 
-def bloquear_disco():
-    """Bloquea la unidad BitLocker especificada."""
-    comando = f'manage-bde -lock {LETRA_UNIDAD} -forcedismount'
-    try:
-        resultado = subprocess.run(comando, shell=True, capture_output=True, text=True, encoding='cp850', errors='replace')
-        if resultado.returncode == 0:
-            print(f"\n✅ Disco {LETRA_UNIDAD} bloqueado correctamente.")
-        else:
-            print(f"\n❌ Error al bloquear el disco:\n{resultado.stderr}")
-    except Exception as e:
-        print(f"\n⚠️ Excepción al bloquear el disco: {str(e)}")
+    Write-Host "[+] Copiando archivo RAW..."
+    $buf = New-Object byte[] 4MB
+    $in  = [IO.File]::OpenRead($src)
+    $out = [IO.File]::OpenWrite($dst)
 
-def desbloquear_disco():
-    """
-    Desbloquea la unidad BitLocker especificada en modo interactivo.
-    Si la contraseña es incorrecta, permite reintentar.
-    """
-    while True:
-        print(f"\n🔓 Se solicitará la contraseña de BitLocker para desbloquear la unidad {LETRA_UNIDAD}...")
-        comando = f'manage-bde -unlock {LETRA_UNIDAD} -password'
-        try:
-            subprocess.run(comando, shell=True)
-        except Exception as e:
-            print(f"⚠️ Error al ejecutar el comando de desbloqueo: {str(e)}")
-            break
+    while (($r = $in.Read($buf,0,$buf.Length)) -gt 0) {
+        $out.Write($buf,0,$r)
+    }
 
-        # Verificar si se desbloqueó con éxito
-        estado = estado_disco()
-        if estado == "desbloqueado":
-            print(f"\n✅ El disco {LETRA_UNIDAD} se ha desbloqueado correctamente.")
-            break
-        else:
-            print("\n❌ Contraseña incorrecta o desbloqueo fallido.")
-            opcion = input("¿Querés intentar de nuevo? (s/n): ").lower()
-            clear_console()
-            if opcion != 's':
-                break
+    $in.Close(); $out.Close()
+    Write-Host "[+] Archivo copiado a $dst"
+}
 
-def main():
-    """Función principal del script."""
-    try:
-        if ctypes.windll.shell32.IsUserAnAdmin() == 0:
-            print("⚠️ Este script debe ejecutarse como administrador.")
-            input("Presiona Enter para salir...")
-            clear_console()
-            return
-    except Exception:
-        print("⚠️ No se pudo verificar si el script se ejecuta como administrador.")
+# MAIN
+Write-Host "`n[+] BitLocker / USB Auto DFIR Tool`n"
 
-    estado = estado_disco()
-    if estado is None:
-        print(f"\nNo se pudo determinar el estado del disco {LETRA_UNIDAD}.")
-        input("Presiona Enter para salir...")
-        clear_console()
-        return
+if (-not (Is-Admin)) {
+    Write-Host "[!] Ejecutar como Administrador."
+    exit 1
+}
 
-    print(f"\n📦 El disco {LETRA_UNIDAD} está actualmente: {estado.upper()}")
+$drive = Read-Host "Ingrese la partición (ej: E:)"
+if ($drive -notmatch "^[A-Z]:$" -or -not (Drive-Accessible $drive)) {
+    Write-Host "[!] Volumen inválido o no accesible."
+    exit 1
+}
 
-    if estado == "desbloqueado":
-        opcion = input("¿Querés bloquearlo? (s/n): ").lower()
-        clear_console()
-        if opcion == 's':
-            bloquear_disco()
-    elif estado == "bloqueado":
-        opcion = input("¿Querés desbloquearlo? (s/n): ").lower()
-        clear_console()
-        if opcion == 's':
-            desbloquear_disco()
+$edition = Get-WindowsEdition
+$hasBDE  = ManageBDE-Exists
+$bus     = Get-DriveBusType $drive
 
-    input("\nPresiona Enter para salir...")
-    clear_console()
+Write-Host "[i] Windows Edition : $edition"
+Write-Host "[i] manage-bde     : $hasBDE"
+Write-Host "[i] Bus Type       : $bus"
 
-if __name__ == "__main__":
-    main()
+# MODO WINDOWS HOME / SIN BITLOCKER
+if ($edition -match "Home" -or -not $hasBDE) {
+    Write-Host "`n[MODE] Windows Home / Sin BitLocker admin"
+    Write-Host "[+] Modo LECTURA forense"
+
+    Write-Host "[+] Listando archivos..."
+    Get-ChildItem "$drive\" -Recurse -Force -ErrorAction SilentlyContinue |
+        Where-Object { -not $_.PSIsContainer } |
+        Select-Object FullName, Length, LastWriteTime |
+        Format-Table -AutoSize
+
+    $src = Read-Host "`nRuta COMPLETA de archivo a copiar (Enter para salir)"
+    if ($src -and (Test-Path $src)) {
+        Copy-RawFile $src
+    }
+
+    Write-Host "`n[FIN]"
+    exit 0
+}
+
+# MODO WINDOWS PRO / BITLOCKER
+$status = Get-BitLockerStatus $drive
+if (-not $status) {
+    Write-Host "[!] No se pudo obtener estado BitLocker."
+    exit 1
+}
+
+if ($status -match "Bloqueado|Locked") {
+    Write-Host "[!] Unidad BLOQUEADA. Desbloquee primero."
+    exit 1
+}
+
+if ($status -match "Sin cifrar|Fully Decrypted|Protección desactivada") {
+    Write-Host "[+] Unidad ya desencriptada."
+    Start-Process explorer.exe $drive
+    exit 0
+}
+
+Write-Host "`n[+] Iniciando desencriptado BitLocker..."
+$proc = Start-Process manage-bde.exe `
+        -ArgumentList "-off $drive" `
+        -Wait -PassThru -NoNewWindow
+
+if ($proc.ExitCode -ne 0) {
+    Write-Host "[!] Error en manage-bde (ExitCode $($proc.ExitCode))"
+    exit 1
+}
+
+Write-Host "[+] Desencriptado iniciado. Abriendo volumen..."
+Start-Process explorer.exe $drive
+
+Write-Host "`n[FIN]"
